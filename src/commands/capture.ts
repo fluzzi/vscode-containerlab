@@ -101,7 +101,7 @@ async function genPacketflixURI(node: ClabInterfaceTreeNode,
 
   const containerStr = encodeURIComponent(`{"network-interfaces":["${node.name}"],"name":"${node.parentName}","type":"docker"}`)
 
-  const uri = `packetflix:ws://${bracketed}:${packetflixPort}/capture?container=${containerStr}&nif=${node.name}`
+  const uri = `packetflix:wss://${bracketed}:${packetflixPort}/capture?container=${containerStr}&nif=${node.name}`
 
   vscode.window.showInformationMessage(
     `Starting edgeshark capture on ${node.parentName}/${node.name}...`
@@ -136,7 +136,7 @@ async function captureMultipleEdgeshark(nodes: ClabInterfaceTreeNode[]) {
   const config = vscode.workspace.getConfiguration("containerlab");
   const packetflixPort = config.get<number>("remote.packetflixPort", 5001);
 
-  const packetflixUri = `packetflix:ws://${bracketed}:${packetflixPort}/capture?container=${containerStr}&nif=${nifParam}`;
+  const packetflixUri = `packetflix:wss://${bracketed}:${packetflixPort}/capture?container=${containerStr}&nif=${nifParam}`;
 
   vscode.window.showInformationMessage(
     `Starting multi-interface edgeshark on ${base.parentName} for: ${ifNames.join(", ")}`

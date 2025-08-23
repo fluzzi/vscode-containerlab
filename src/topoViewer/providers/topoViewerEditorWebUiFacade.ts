@@ -187,22 +187,25 @@ export class TopoViewerEditor {
     const templateContent = `
 name: ${baseNameWithoutExt} # saved as ${targetFileUri.fsPath}
 
+mgmt:
+  network: web
+  bridge: web
+  ipv4-subnet: 10.21.97.0/24
+  ipv4-gw: 10.21.97.1
+
 topology:
   nodes:
-    srl1:
-      kind: nokia_srlinux
-      type: ixrd1
-      image: ghcr.io/nokia/srlinux:latest
+    xrd1:
+      kind: cisco_xrd
+      image: ios-xr/xrd-control-plane:24.4.1
 
-    srl2:
-      kind: nokia_srlinux
-      type: ixrd1
-      image: ghcr.io/nokia/srlinux:latest
+    xrd2:
+      kind: cisco_xrd
+      image: ios-xr/xrd-control-plane:24.4.1
 
   links:
-    # inter-switch link
-    - endpoints: [ srl1:e1-1, srl2:e1-1 ]
-    - endpoints: [ srl1:e1-2, srl2:e1-2 ]
+    - endpoints: [ xrd1:Gi0-0-0-1, xrd2:Gi0-0-0-1 ]
+    - endpoints: [ xrd1:Gi0-0-0-2, xrd2:Gi0-0-0-2 ]
 `;
 
     try {

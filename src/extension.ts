@@ -236,6 +236,9 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('containerlab.lab.toggleFavorite', cmd.toggleFavorite)
   );
   context.subscriptions.push(
+    vscode.commands.registerCommand('containerlab.lab.togglePersist', cmd.togglePersist)
+  );
+  context.subscriptions.push(
     vscode.commands.registerCommand('containerlab.lab.delete', cmd.deleteLab)
   );
 

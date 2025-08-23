@@ -110,6 +110,11 @@
         "icon": "$(star)"
       },
       {
+        "command": "containerlab.lab.togglePersist",
+        "title": "Toggle Persist",
+        "icon": "$(star)"
+      },
+      {
         "command": "containerlab.lab.delete",
         "title": "Delete lab file",
         "icon": "$(trash)"
@@ -746,6 +751,11 @@
           "title": "Remove from Favorites",
           "when": "view == runningLabs && viewItem =~ /containerlabLab.*Favorite/",
           "group": "_favorites@0"
+        },
+        {
+          "command": "containerlab.lab.togglePersist",
+          "when": "viewItem =~ /containerlabLab/",
+          "group": "_favorites@1"
         },
         {
           "command": "containerlab.lab.deploy",
