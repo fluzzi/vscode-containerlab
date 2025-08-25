@@ -1,5 +1,5 @@
 import cytoscape from 'cytoscape';
-import { log } from '../logging/webviewLogger';
+import { log } from '../logging/logger';
 import { generateEncodedSVG, NodeType } from './managerSvgGenerator';
 
 /**
@@ -95,4 +95,3 @@ export function exportViewportAsSvg(cy: cytoscape.Core): void {
     log.error(`Error capturing topology: ${error}`);
   }
 }
-

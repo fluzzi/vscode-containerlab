@@ -19,6 +19,7 @@ import { ManagerViewportPanels } from './managerViewportPanels';
 import { ManagerUnifiedFloatingPanel } from './managerUnifiedFloatingPanel';
 import { ManagerFreeText } from './managerFreeText';
 import { ManagerGroupStyle } from './managerGroupStyle';
+import { CopyPasteManager } from './managerCopyPaste';
 import { exportViewportAsSvg } from './utils';
 import type { ManagerGroupManagement } from './managerGroupManagement';
 import type { ManagerLayoutAlgo } from './managerLayoutAlgo';
@@ -27,11 +28,13 @@ import type { ManagerLabelEndpoint } from './managerLabelEndpoint';
 import type { ManagerReloadTopo } from './managerReloadTopo';
 import { ManagerShortcutDisplay } from './managerShortcutDisplay';
 import { layoutAlgoManager as layoutAlgoManagerSingleton, getGroupManager, zoomToFitManager as zoomToFitManagerSingleton, labelEndpointManager as labelEndpointManagerSingleton, getReloadTopoManager } from '../core/managerRegistry';
-import { log } from '../logging/webviewLogger';
+import { log } from '../logging/logger';
 import { registerCyEventHandlers } from './cyEventHandlers';
 import topoViewerState from '../state';
 import type { EdgeData } from '../types/topoViewerGraph';
 import { FilterUtils } from '../../helpers/filterUtils';
+import { isSpecialNodeOrBridge, isSpecialEndpoint } from '../utilities/specialNodes';
+
 
 
 
@@ -60,6 +63,7 @@ class TopologyWebviewController {
   public labelEndpointManager: ManagerLabelEndpoint;
   public reloadTopoManager: ManagerReloadTopo;
   public freeTextManager?: ManagerFreeText;
+  public copyPasteManager: CopyPasteManager;
   // eslint-disable-next-line no-unused-vars
   public captureViewportManager: { viewportButtonsCaptureViewportAsSvg: (cy: cytoscape.Core) => void };
   private interfaceCounters: Record<string, number> = {};
@@ -294,6 +298,9 @@ class TopologyWebviewController {
     this.groupStyleManager = new ManagerGroupStyle(this.cy, this.messageSender, this.freeTextManager);
     this.freeTextManager.setGroupStyleManager(this.groupStyleManager);
 
+    // Initialize copy paste manager
+    this.copyPasteManager = new CopyPasteManager(this.cy, this.messageSender, this.groupStyleManager, this.freeTextManager);
+
     // Load annotations after managers are created
     // We need to wait a bit for the initial layout to complete
     setTimeout(() => {
@@ -339,7 +346,7 @@ class TopologyWebviewController {
     };
 
     // Add double-click handlers for opening editors
-    this.cy.on('dblclick', 'node[topoViewerRole != "freeText"][topoViewerRole != "dummyChild"]', (event) => {
+    this.cy.on('dblclick', 'node[topoViewerRole != "freeText"]', (event) => {
       const node = event.target;
       if (node.data('topoViewerRole') === 'group') {
         this.groupManager.showGroupEditor(node);
@@ -415,6 +422,12 @@ class TopologyWebviewController {
         } catch (error) {
           log.error(`Error processing updateTopology message: ${error}`);
         }
+      } else if (msg.type === 'copiedElements') {
+        const addedElements = this.copyPasteManager.performPaste(msg.data);
+        if (addedElements && addedElements.length > 0) {
+          // Save after paste operation
+          this.saveManager.viewportButtonsSaveTopo(this.cy, true);
+        }
       }
     });
 
@@ -445,7 +458,7 @@ class TopologyWebviewController {
           !sourceNode.same(targetNode) &&
           !sourceNode.isParent() &&
           !targetNode.isParent() &&
-          targetRole !== 'dummyChild'
+          targetRole !== 'group'
         );
       },
       edgeParams: (sourceNode: cytoscape.NodeSingular, targetNode: cytoscape.NodeSingular): EdgeData => {
@@ -534,9 +547,9 @@ class TopologyWebviewController {
 
     // Only initialize other context menus in edit mode
     if (mode === 'edit') {
-      // Context menu for regular nodes (excluding groups, dummyChild, and freeText)
+      // Context menu for regular nodes (excluding groups and freeText)
       this.cy.cxtmenu({
-        selector: 'node[topoViewerRole != "group"][topoViewerRole != "dummyChild"][topoViewerRole != "freeText"]',
+        selector: 'node[topoViewerRole != "group"][topoViewerRole != "freeText"]',
         commands: (ele: cytoscape.Singular) => {
           const commands: any[] = [];
 
@@ -646,7 +659,7 @@ class TopologyWebviewController {
     });
 
     this.cy.cxtmenu({
-      selector: 'node:parent, node[topoViewerRole = "dummyChild"], node[topoViewerRole = "group"]',
+      selector: 'node:parent, node[topoViewerRole = "group"]',
       commands: [
         {
           content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
@@ -662,10 +675,7 @@ class TopologyWebviewController {
               this.viewportPanels?.setNodeClicked(true);
             // inside here TS infers ele is NodeSingular
             // this.viewportPanels.panelNodeEditor(ele);
-            if (ele.data("topoViewerRole") == "dummyChild") {
-              log.debug(`Editing parent of dummyChild: ${ele.parent().first().id()}`);
-              this.groupManager.showGroupEditor(ele.parent().first().id());
-            } else if (ele.data("topoViewerRole") == "group") {
+            if (ele.data("topoViewerRole") == "group") {
               this.groupManager.showGroupEditor(ele.id());
             }
           }
@@ -681,9 +691,7 @@ class TopologyWebviewController {
               return;
             }
             let groupId: string;
-            if (ele.data("topoViewerRole") == "dummyChild") {
-              groupId = ele.parent().first().id();
-            } else if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
+            if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
               groupId = ele.id();
             } else {
               return;
@@ -764,9 +772,9 @@ class TopologyWebviewController {
     // Add radial context menu for viewer mode
     if (mode === 'view') {
       const self = this;
-      // Context menu for regular nodes (excluding groups, dummyChild, and freeText)
+      // Context menu for regular nodes (excluding groups and freeText)
       this.cy.cxtmenu({
-        selector: 'node[topoViewerRole != "group"][topoViewerRole != "dummyChild"][topoViewerRole != "freeText"]',
+        selector: 'node[topoViewerRole != "group"][topoViewerRole != "freeText"]',
         commands: (ele: cytoscape.Singular) => {
           // Skip special endpoints - they don't have SSH/Shell/Logs
           if (self.isNetworkNode(ele.id())) {
@@ -911,13 +919,13 @@ class TopologyWebviewController {
 
             // Check for all types of special network endpoints (bridge, host, mgmt-net, macvlan)
             const sourceIsSpecialNetwork =
-              self.isSpecialEndpoint(sourceName) ||
+              isSpecialNodeOrBridge(sourceName, self.cy) ||
               (sourceNode.length > 0 &&
                 (sourceNode.data('extraData')?.kind === 'bridge' ||
                  sourceNode.data('extraData')?.kind === 'ovs-bridge'));
 
             const targetIsSpecialNetwork =
-              self.isSpecialEndpoint(targetName) ||
+              isSpecialNodeOrBridge(targetName, self.cy) ||
               (targetNode.length > 0 &&
                 (targetNode.data('extraData')?.kind === 'bridge' ||
                  targetNode.data('extraData')?.kind === 'ovs-bridge'));
@@ -1115,7 +1123,7 @@ class TopologyWebviewController {
 
       // Context menu for groups (same as in editor mode for group wheel functionality)
       this.cy.cxtmenu({
-        selector: 'node:parent, node[topoViewerRole = "dummyChild"], node[topoViewerRole = "group"]',
+        selector: 'node:parent, node[topoViewerRole = "group"]',
         commands: [
           {
             content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
@@ -1130,9 +1138,7 @@ class TopologyWebviewController {
               // Use setTimeout to ensure this runs after any other event handlers
               setTimeout(() => {
                 let groupId: string;
-                if (ele.data("topoViewerRole") == "dummyChild") {
-                  groupId = ele.parent().first().id();
-                } else if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
+                if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
                   groupId = ele.id();
                 } else {
                   return;
@@ -1154,9 +1160,7 @@ class TopologyWebviewController {
               // Use setTimeout to ensure this runs after any other event handlers
               setTimeout(() => {
                 let groupId: string;
-                if (ele.data("topoViewerRole") == "dummyChild") {
-                  groupId = ele.parent().first().id();
-                } else if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
+                if (ele.data("topoViewerRole") == "group" || ele.isParent()) {
                   groupId = ele.id();
                 } else {
                   return;
@@ -1276,6 +1280,18 @@ class TopologyWebviewController {
           this.handleSelectAll();
         } else if (event.key.toLowerCase() === 'g') {
           this.groupManager.viewportButtonsAddGroup();
+        } else if (event.ctrlKey && event.key.toLowerCase() === 'c') {
+          event.preventDefault();
+          this.copyPasteManager.handleCopy();
+        } else if (event.ctrlKey && event.key.toLowerCase() === 'v' && this.isViewportDrawerClabEditorChecked) {
+          event.preventDefault();
+          this.copyPasteManager.handlePaste();
+        } else if (event.ctrlKey && event.key.toLowerCase() === 'x' && this.isViewportDrawerClabEditorChecked) {
+          event.preventDefault();
+          this.handleCutKeyPress();
+        } else if (event.ctrlKey && event.key.toLowerCase() === 'd' && this.isViewportDrawerClabEditorChecked) {
+          event.preventDefault();
+          this.copyPasteManager.handleDuplicate();
         }
       });
 
@@ -1356,16 +1372,8 @@ class TopologyWebviewController {
 
   }
 
-  private isSpecialEndpoint(nodeId: string): boolean {
-    return (
-      nodeId.startsWith('host:') ||
-      nodeId.startsWith('mgmt-net:') ||
-      nodeId.startsWith('macvlan:')
-    );
-  }
-
   private isNetworkNode(nodeId: string): boolean {
-    if (this.isSpecialEndpoint(nodeId)) {
+    if (isSpecialNodeOrBridge(nodeId, this.cy)) {
       return true;
     }
     const node = this.cy.getElementById(nodeId);
@@ -1482,6 +1490,51 @@ class TopologyWebviewController {
   }
 
   /**
+   * Handles Ctrl+X to cut (copy then remove) selected nodes and edges
+   * @private
+   */
+  private async handleCutKeyPress(): Promise<void> {
+    // Copy current selection
+    this.copyPasteManager.handleCopy();
+
+    // Get all selected elements
+    const selectedElements = this.cy.$(':selected');
+    if (selectedElements.length === 0) {
+      return;
+    }
+
+    // Remove selected nodes
+    const selectedNodes = selectedElements.nodes();
+    selectedNodes.forEach(node => {
+      const topoViewerRole = node.data('topoViewerRole');
+
+      if (topoViewerRole === 'freeText') {
+        this.freeTextManager?.removeFreeTextAnnotation(node.id());
+      } else if (topoViewerRole === 'group') {
+        if (this.isViewportDrawerClabEditorChecked) {
+          this.groupManager?.directGroupRemoval(node.id());
+        }
+      } else {
+        const isNodeInEditMode = node.data('editor') === 'true';
+        if (this.isViewportDrawerClabEditorChecked && isNodeInEditMode) {
+          node.remove();
+        }
+      }
+    });
+
+    // Remove selected edges
+    const selectedEdges = selectedElements.edges();
+    selectedEdges.forEach(edge => {
+      if (this.isViewportDrawerClabEditorChecked) {
+        edge.remove();
+      }
+    });
+
+    // Save after cut
+    await this.saveManager.viewportButtonsSaveTopo(this.cy, true);
+  }
+
+  /**
    * Determines the next available endpoint identifier for a given node.
    * @param nodeId - The ID of the node.
    * @returns The next available endpoint string.
@@ -1493,7 +1546,7 @@ class TopologyWebviewController {
     // append an automatically generated endpoint (e.g. `eth1`). Returning an
     // empty string here ensures that the calling code stores only the node ID
     // itself as the link endpoint.
-    if (this.isSpecialEndpoint(nodeId)) {
+    if (isSpecialEndpoint(nodeId)) {
       return '';
     }
 
@@ -1614,8 +1667,8 @@ class TopologyWebviewController {
   public async bulkCreateLinks(sourceFilterText: string, targetFilterText: string): Promise<void> {
     const sourceFilter = FilterUtils.createFilter(sourceFilterText);
     const targetFilter = FilterUtils.createFilter(targetFilterText);
-    const sources = this.cy.nodes('node[topoViewerRole != "freeText"][topoViewerRole != "group"][topoViewerRole != "dummyChild"]').filter((node) => sourceFilter(node.data('name')));
-    const targets = this.cy.nodes('node[topoViewerRole != "freeText"][topoViewerRole != "group"][topoViewerRole != "dummyChild"]').filter((node) => targetFilter(node.data('name')));
+    const sources = this.cy.nodes('node[topoViewerRole != "freeText"][topoViewerRole != "group"]').filter((node) => sourceFilter(node.data('name')));
+    const targets = this.cy.nodes('node[topoViewerRole != "freeText"][topoViewerRole != "group"]').filter((node) => targetFilter(node.data('name')));
 
     // Calculate potential links to show in confirmation
     let potentialLinks = 0;
