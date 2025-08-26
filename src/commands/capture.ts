@@ -159,9 +159,27 @@ export async function captureInterfaceWithPacketflix(
   if (!packetflixUri) {
     return
   }
+  await gateStart();
 
   vscode.env.openExternal(vscode.Uri.parse(packetflixUri[0]));
 }
+
+const GATE_URL = "http://127.0.0.1:8088";
+
+async function gateStart(): Promise<void> {
+  try {
+    const res = await fetch(`${GATE_URL}/start`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`gate /start -> ${res.status} ${body}`);
+    }
+  } catch (e: any) {
+    outputChannel.appendLine(`[gate] start failed: ${e?.message || e}`);
+    vscode.window.showErrorMessage(`Capture gate failed to start: ${e?.message || e}`);
+    throw e;
+  }
+}
+
 
 // Capture using Edgeshark + Wireshark via VNC in a webview
 export async function captureEdgesharkVNC(
@@ -173,7 +191,7 @@ export async function captureEdgesharkVNC(
   if (!packetflixUri) {
     return
   }
-
+  await gateStart();
   const wsConfig = vscode.workspace.getConfiguration("containerlab")
   const dockerImage = wsConfig.get<string>("capture.wireshark.dockerImage", "ghcr.io/kaelemc/wireshark-vnc-docker:latest")
   const dockerPullPolicy = wsConfig.get<string>("capture.wireshark.pullPolicy", "always")
