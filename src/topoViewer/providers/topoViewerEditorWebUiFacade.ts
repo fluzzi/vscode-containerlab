@@ -14,6 +14,7 @@ import { runningLabsProvider } from "../../extension";
 import { validateYamlContent } from '../utilities/yamlValidator';
 import { saveViewport } from '../utilities/saveViewport';
 import { annotationsManager } from '../utilities/annotationsManager';
+import { perfMark, perfMeasure, perfSummary } from '../utilities/performanceMonitor';
 
 /**
  * Class representing the TopoViewer Editor Webview Panel.
@@ -245,7 +246,19 @@ topology:
    * Internal method to update panel HTML without mode switch checks (used during panel creation)
    */
   private async updatePanelHtmlInternal(panel: vscode.WebviewPanel | undefined): Promise<boolean> {
-    return this.updatePanelHtmlCore(panel);
+    return this.updatePanelHtmlCore(panel, true);
+  }
+
+  /**
+   * Force update panel HTML after command completion, bypassing all checks
+   */
+  public async forceUpdateAfterCommand(panel: vscode.WebviewPanel | undefined): Promise<boolean> {
+    // Clear any mode switching flags that might block updates
+    this.isSwitchingMode = false;
+    this.isUpdating = false;
+
+    // Force the update
+    return this.updatePanelHtmlCore(panel, true);
   }
 
   /**
@@ -285,9 +298,13 @@ topology:
   /**
    * Core implementation of updating panel HTML
    */
-  private async updatePanelHtmlCore(panel: vscode.WebviewPanel | undefined): Promise<boolean> {
+  private async updatePanelHtmlCore(panel: vscode.WebviewPanel | undefined, isInitialLoad: boolean = false): Promise<boolean> {
     if (!this.currentLabName) {
       return false;
+    }
+
+    if (isInitialLoad) {
+      perfMark('updatePanelHtmlCore_start');
     }
 
     const yamlFilePath = this.lastYamlFilePath;
@@ -353,6 +370,17 @@ topology:
       }
     }
 
+    // Skip expensive operations on subsequent updates if content hasn't changed meaningfully
+    if (!isInitialLoad) {
+      // Check if we really need to regenerate everything
+      const cachedYaml = this.context.workspaceState.get<string>(`cachedYaml_${folderName}`);
+      if (cachedYaml === yamlContent && !this.isViewMode) {
+        // Content hasn't changed, skip regeneration
+        log.debug('Skipping topology regeneration - content unchanged');
+        return true;
+      }
+    }
+
     const cytoTopology = await this.adaptor.clabYamlToCytoscapeElements(
       yamlContent,
       updatedClabTreeDataToTopoviewer,
@@ -360,14 +388,30 @@ topology:
     );
 
     try {
-      await this.adaptor.createFolderAndWriteJson(this.context, folderName, cytoTopology, yamlContent);
+      // Write JSON files asynchronously without waiting
+      const writePromise = this.adaptor.createFolderAndWriteJson(this.context, folderName, cytoTopology, yamlContent);
+
+      // Don't wait for file write on initial load
+      if (isInitialLoad) {
+        writePromise.catch(err => {
+          log.error(`Background write failed: ${String(err)}`);
+        });
+      } else {
+        await writePromise;
+      }
+
+      // Cache the YAML content
+      await this.context.workspaceState.update(`cachedYaml_${folderName}`, yamlContent);
     } catch (err) {
       log.error(`Failed to write topology files: ${String(err)}`);
-      vscode.window.showErrorMessage(`Failed to write topology files: ${err}`);
+      if (!isInitialLoad) {
+        vscode.window.showErrorMessage(`Failed to write topology files: ${err}`);
+      }
       return false;
     }
 
     if (panel) {
+      perfMark('generateHtml_start');
       const mode: TemplateMode = this.isViewMode ? 'viewer' : 'editor';
       let templateParams: any = {};
 
@@ -407,6 +451,11 @@ topology:
         templateParams
       );
 
+      if (isInitialLoad) {
+        perfMeasure('generateHtml', 'generateHtml_start');
+        perfMeasure('updatePanelHtmlCore', 'updatePanelHtmlCore_start');
+      }
+
     } else {
       log.error('Panel is undefined');
       return false;
@@ -420,6 +469,7 @@ topology:
    * @param context The extension context.
    */
   public async createWebviewPanel(context: vscode.ExtensionContext, fileUri: vscode.Uri, labName: string, viewMode: boolean = false): Promise<void> {
+    perfMark('createWebviewPanel_start');
     this.currentLabName = labName;
     this.isViewMode = viewMode;
 
@@ -529,22 +579,15 @@ topology:
         }
       }
 
-      let treeData: Record<string, ClabLabTreeNode> | undefined = undefined;
+      // Skip initial processing - updatePanelHtmlInternal will handle it
+      // This avoids duplicate YAML processing and file writes
       if (this.isViewMode) {
         try {
-          treeData = await runningLabsProvider.discoverInspectLabs();
-          this.cacheClabTreeDataToTopoviewer = treeData;
+          this.cacheClabTreeDataToTopoviewer = await runningLabsProvider.discoverInspectLabs();
         } catch (err) {
           log.warn(`Failed to load running lab data: ${err}`);
         }
       }
-      const cyElements = await this.adaptor.clabYamlToCytoscapeElements(yaml, treeData, this.lastYamlFilePath);
-      await this.adaptor.createFolderAndWriteJson(
-        this.context,
-        labName,                // folder below <extension>/topoViewerData/
-        cyElements,
-        yaml
-      );
     } catch (e) {
       if (!this.isViewMode) {
         vscode.window.showErrorMessage(`Failed to load topology: ${(e as Error).message}`);
@@ -556,7 +599,20 @@ topology:
 
 
 
-    await this.updatePanelHtmlInternal(this.currentPanel);
+    // Start loading the panel HTML immediately
+    perfMark('updatePanelHtml_start');
+    const updatePromise = this.updatePanelHtmlInternal(this.currentPanel);
+
+    // Don't block on the update for initial load
+    updatePromise
+      .then(() => {
+        perfMeasure('updatePanelHtml', 'updatePanelHtml_start');
+        perfMeasure('createWebviewPanel_total', 'createWebviewPanel_start');
+        perfSummary();
+      })
+      .catch(err => {
+        log.error(`Failed to update panel HTML: ${err}`);
+      });
 
     // Only setup file watchers and save listeners in edit mode
     if (!this.isViewMode && this.lastYamlFilePath) {
@@ -862,6 +918,31 @@ topology:
             break;
           }
 
+          case 'clab-interface-capture': {
+            try {
+              const data = payloadObj as { nodeName: string; interfaceName: string };
+              const iface = {
+                label: data.interfaceName,
+                parentName: data.nodeName,
+                cID: data.nodeName,
+                name: data.interfaceName,
+                type: '',
+                alias: '',
+                mac: '',
+                mtu: 0,
+                ifIndex: 0,
+                state: ''
+              } as any;
+              // Use the default capture method (same as tree view)
+              await vscode.commands.executeCommand('containerlab.interface.capture', iface);
+              result = `Capture executed for ${data.nodeName}/${data.interfaceName}`;
+            } catch (innerError) {
+              error = `Error executing capture: ${innerError}`;
+              log.error(`Error executing capture: ${JSON.stringify(innerError, null, 2)}`);
+            }
+            break;
+          }
+
           case 'clab-link-capture': {
             try {
               const data = payloadObj as { nodeName: string; interfaceName: string };
@@ -1059,11 +1140,10 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.deploy', tempNode);
+              // Execute the command and wait for it to complete
+              // The command will notify us via notifyCurrentTopoViewerOfCommandSuccess when done
+              vscode.commands.executeCommand('containerlab.lab.deploy', tempNode);
               result = `Lab deployment initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error deploying lab: ${innerError}`;
               log.error(`Error deploying lab: ${JSON.stringify(innerError, null, 2)}`);
@@ -1087,11 +1167,10 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.destroy', tempNode);
+              // Execute the command and wait for it to complete
+              // The command will notify us via notifyCurrentTopoViewerOfCommandSuccess when done
+              vscode.commands.executeCommand('containerlab.lab.destroy', tempNode);
               result = `Lab destruction initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error destroying lab: ${innerError}`;
               log.error(`Error destroying lab: ${JSON.stringify(innerError, null, 2)}`);
@@ -1115,11 +1194,10 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.deploy.cleanup', tempNode);
+              // Execute the command and wait for it to complete
+              // The command will notify us via notifyCurrentTopoViewerOfCommandSuccess when done
+              vscode.commands.executeCommand('containerlab.lab.deploy.cleanup', tempNode);
               result = `Lab deployment with cleanup initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error deploying lab with cleanup: ${innerError}`;
               log.error(`Error deploying lab with cleanup: ${JSON.stringify(innerError, null, 2)}`);
@@ -1143,11 +1221,10 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.destroy.cleanup', tempNode);
+              // Execute the command and wait for it to complete
+              // The command will notify us via notifyCurrentTopoViewerOfCommandSuccess when done
+              vscode.commands.executeCommand('containerlab.lab.destroy.cleanup', tempNode);
               result = `Lab destruction with cleanup initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error destroying lab with cleanup: ${innerError}`;
               log.error(`Error destroying lab with cleanup: ${JSON.stringify(innerError, null, 2)}`);
@@ -1171,11 +1248,9 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.redeploy', tempNode);
+              // Execute the command and wait for it to complete
+              vscode.commands.executeCommand('containerlab.lab.redeploy', tempNode);
               result = `Lab redeploy initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error redeploying lab: ${innerError}`;
               log.error(`Error redeploying lab: ${JSON.stringify(innerError, null, 2)}`);
@@ -1199,11 +1274,9 @@ topology:
                 { absolute: labPath, relative: '' }
               );
 
-              await vscode.commands.executeCommand('containerlab.lab.redeploy.cleanup', tempNode);
+              // Execute the command and wait for it to complete
+              vscode.commands.executeCommand('containerlab.lab.redeploy.cleanup', tempNode);
               result = `Lab redeploy with cleanup initiated for ${labPath}`;
-
-              // Refresh deployment state instead of forcing it
-              this.deploymentState = await this.checkDeploymentState(this.currentLabName);
             } catch (innerError) {
               error = `Error redeploying lab with cleanup: ${innerError}`;
               log.error(`Error redeploying lab with cleanup: ${JSON.stringify(innerError, null, 2)}`);

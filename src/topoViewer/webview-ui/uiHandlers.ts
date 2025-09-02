@@ -28,12 +28,6 @@ function getMessageSender(): VscodeMessageSender {
   return messageSender;
 }
 
-// Build the full container name based on prefix and lab name settings
-function getFullNodeName(nodeName: string): string {
-  const prefix = topoViewerState.prefixName;
-  const labName = topoViewerState.labName;
-  return prefix === '' ? nodeName : `${prefix}-${labName}-${nodeName}`;
-}
 
 /**
  * Toggle the About panel
@@ -226,15 +220,29 @@ export function viewportNodeFindEvent(): void {
 /**
  * Handle capture/screenshot functionality
  */
-export function viewportDrawerCaptureFunc(event: Event): void {
+export async function viewportDrawerCaptureFunc(event: Event): Promise<void> {
   event.preventDefault();
   try {
     if (!topoViewerState.cy) {
       log.error('Cytoscape instance not available');
       return;
     }
-    const cy = topoViewerState.cy;
-    exportViewportAsSvg(cy);
+
+    const borderZoomInput = document.getElementById('export-border-zoom') as HTMLInputElement | null;
+    const borderPaddingInput = document.getElementById('export-border-padding') as HTMLInputElement | null;
+
+    const borderZoom = borderZoomInput ? parseFloat(borderZoomInput.value) : 100;
+    const borderPadding = borderPaddingInput ? parseFloat(borderPaddingInput.value) : 0;
+
+    await exportViewportAsSvg(topoViewerState.cy, {
+      borderZoom,
+      borderPadding
+    });
+
+    const panel = document.getElementById('viewport-drawer-capture-sceenshoot');
+    if (panel) {
+      panel.style.display = 'none';
+    }
   } catch (error) {
     log.error(`Error capturing topology: ${error}`);
   }
@@ -244,17 +252,16 @@ export function viewportDrawerCaptureFunc(event: Event): void {
  * Capture viewport as SVG - called by the navbar button
  */
 export function viewportButtonsCaptureViewportAsSvg(): void {
-  try {
-    if (!topoViewerState.cy) {
-      log.error('Cytoscape instance not available for SVG capture');
-      return;
-    }
-    const cy = topoViewerState.cy;
-    exportViewportAsSvg(cy);
-    log.info('Viewport captured as SVG');
-  } catch (error) {
-    log.error(`Error capturing viewport as SVG: ${error}`);
+  const panel = document.getElementById('viewport-drawer-capture-sceenshoot');
+  if (!panel) return;
+
+  // Hide other viewport drawers
+  const drawers = document.getElementsByClassName('viewport-drawer');
+  for (let i = 0; i < drawers.length; i++) {
+    (drawers[i] as HTMLElement).style.display = 'none';
   }
+
+  panel.style.display = 'block';
 }
 
 /**
@@ -404,182 +411,6 @@ export async function viewportButtonsSaveTopo(): Promise<void> {
 }
 
 /**
- * Connect to a node via SSH using VS Code backend
- */
-export async function nodeActionConnectToSSH(): Promise<void> {
-  try {
-    const nodeName = topoViewerState.selectedNode;
-    if (!nodeName) {
-      log.warn('No node selected for SSH connection');
-      return;
-    }
-    const sender = getMessageSender();
-    const containerName = getFullNodeName(nodeName);
-    await sender.sendMessageToVscodeEndpointPost('clab-node-connect-ssh', containerName);
-    log.info(`SSH connection requested for node: ${containerName}`);
-  } catch (error) {
-    log.error(`nodeActionConnectToSSH failed: ${error}`);
-  }
-}
-
-/**
- * Attach a shell to the selected node
- */
-export async function nodeActionAttachShell(): Promise<void> {
-  try {
-    const nodeName = topoViewerState.selectedNode;
-    if (!nodeName) {
-      log.warn('No node selected to attach shell');
-      return;
-    }
-    const sender = getMessageSender();
-    const containerName = getFullNodeName(nodeName);
-    await sender.sendMessageToVscodeEndpointPost('clab-node-attach-shell', containerName);
-    log.info(`Attach shell requested for node: ${containerName}`);
-  } catch (error) {
-    log.error(`nodeActionAttachShell failed: ${error}`);
-  }
-}
-
-/**
- * View logs of the selected node
- */
-export async function nodeActionViewLogs(): Promise<void> {
-  try {
-    const nodeName = topoViewerState.selectedNode;
-    if (!nodeName) {
-      log.warn('No node selected to view logs');
-      return;
-    }
-    const sender = getMessageSender();
-    const containerName = getFullNodeName(nodeName);
-    await sender.sendMessageToVscodeEndpointPost('clab-node-view-logs', containerName);
-    log.info(`View logs requested for node: ${containerName}`);
-  } catch (error) {
-    log.error(`nodeActionViewLogs failed: ${error}`);
-  }
-}
-
-/**
- * Remove selected node from its parent group and notify backend
- */
-export async function nodeActionRemoveFromParent(): Promise<void> {
-  try {
-    if (!topoViewerState.cy || !topoViewerState.selectedNode) {
-      log.warn('Cytoscape instance or selected node not available');
-      return;
-    }
-    const cy = topoViewerState.cy;
-    const node = cy
-      .nodes()
-      .filter((ele: any) => ele.data('extraData')?.longname === topoViewerState.selectedNode)[0];
-    if (!node) {
-      log.warn('Selected node not found in cytoscape');
-      return;
-    }
-    const currentParentId = (node.parent() as any).id();
-    node.move({ parent: null });
-    const formerParentNode = cy.getElementById(currentParentId);
-    if (formerParentNode && formerParentNode.isChildless()) {
-      formerParentNode.remove();
-    }
-
-    const sender = getMessageSender();
-    await sender.sendMessageToVscodeEndpointPost('clab-node-release-from-group', {
-      nodeName: topoViewerState.selectedNode,
-      oldParentId: currentParentId,
-    });
-    log.info(`Release from group requested for node: ${topoViewerState.selectedNode}`);
-  } catch (error) {
-    log.error(`nodeActionRemoveFromParent failed: ${error}`);
-  }
-}
-
-/**
- * Capture traffic on link endpoints using backend services
- */
-export async function linkWireshark(
-  _event: Event,
-  option: string,
-  endpoint: string,
-  referenceElementAfterId: string | null
-): Promise<void> {
-  try {
-    if (!topoViewerState.cy || !topoViewerState.selectedEdge) {
-      log.warn('Cytoscape instance or selected edge not available');
-      return;
-    }
-    const cy = topoViewerState.cy;
-    const edge = cy.getElementById(topoViewerState.selectedEdge);
-    const extra = edge.data('extraData') || {};
-    const sourceNode = extra.clabSourceLongName;
-    const sourcePort = extra.clabSourcePort;
-    const targetNode = extra.clabTargetLongName;
-    const targetPort = extra.clabTargetPort;
-
-    let nodeName: string | undefined;
-    let interfaceName: string | undefined;
-    const sender = getMessageSender();
-
-    switch (option) {
-      case 'edgeSharkInterface':
-        if (endpoint === 'source') {
-          nodeName = sourceNode;
-          interfaceName = sourcePort;
-        } else if (endpoint === 'target') {
-          nodeName = targetNode;
-          interfaceName = targetPort;
-        }
-        if (nodeName && interfaceName) {
-          await sender.sendMessageToVscodeEndpointPost('clab-link-capture', { nodeName, interfaceName });
-        }
-        break;
-      case 'edgeSharkSubInterface':
-        if (referenceElementAfterId === 'endpoint-a-top') {
-          nodeName = sourceNode;
-          interfaceName = endpoint;
-        } else if (referenceElementAfterId === 'endpoint-b-top') {
-          nodeName = targetNode;
-          interfaceName = endpoint;
-        }
-        if (nodeName && interfaceName) {
-          await sender.sendMessageToVscodeEndpointPost('clab-link-capture', { nodeName, interfaceName });
-        }
-        break;
-      case 'edgeSharkInterfaceVnc':
-        if (endpoint === 'source') {
-          nodeName = sourceNode;
-          interfaceName = sourcePort;
-        } else if (endpoint === 'target') {
-          nodeName = targetNode;
-          interfaceName = targetPort;
-        }
-        if (nodeName && interfaceName) {
-          await sender.sendMessageToVscodeEndpointPost('clab-link-capture-edgeshark-vnc', { nodeName, interfaceName });
-        }
-        break;
-      case 'edgeSharkSubInterfaceVnc':
-        if (referenceElementAfterId === 'endpoint-a-vnc-top') {
-          nodeName = sourceNode;
-          interfaceName = endpoint;
-        } else if (referenceElementAfterId === 'endpoint-b-vnc-top') {
-          nodeName = targetNode;
-          interfaceName = endpoint;
-        }
-        if (nodeName && interfaceName) {
-          await sender.sendMessageToVscodeEndpointPost('clab-link-capture-edgeshark-vnc', { nodeName, interfaceName });
-        }
-        break;
-      default:
-        log.warn(`linkWireshark - Unknown option ${option}`);
-        break;
-    }
-  } catch (error) {
-    log.error(`linkWireshark error: ${error}`);
-  }
-}
-
-/**
  * Toggle split view with YAML editor
  */
 export async function viewportButtonsToggleSplit(event?: Event): Promise<void> {
@@ -609,11 +440,6 @@ export function initializeGlobalHandlers(): void {
   (globalThis as any).viewportNodeFindEvent = viewportNodeFindEvent;
   (globalThis as any).viewportDrawerCaptureFunc = viewportDrawerCaptureFunc;
   (globalThis as any).viewportButtonsToggleSplit = viewportButtonsToggleSplit;
-  (globalThis as any).nodeActionConnectToSSH = nodeActionConnectToSSH;
-  (globalThis as any).nodeActionAttachShell = nodeActionAttachShell;
-  (globalThis as any).nodeActionViewLogs = nodeActionViewLogs;
-  (globalThis as any).nodeActionRemoveFromParent = nodeActionRemoveFromParent;
-  (globalThis as any).linkWireshark = linkWireshark;
 
   log.info('Global UI handlers initialized');
 }

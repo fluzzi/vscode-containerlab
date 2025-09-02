@@ -1,6 +1,7 @@
 import cytoscape from 'cytoscape';
 import { log } from '../logging/logger';
 import { generateEncodedSVG, NodeType } from './managerSvgGenerator';
+import { loadExtension } from '../cytoscapeInstanceFactory';
 
 /**
  * Replace PNG image elements with their original SVG versions for node icons.
@@ -68,29 +69,88 @@ export function replacePngWithSvg(svg: string): string {
 }
 
 /**
+ * Options for exporting the Cytoscape viewport as SVG.
+ */
+export interface ExportSvgOptions {
+  borderZoom?: number; // Percentage zoom for the bounding box (100 = default)
+  borderPadding?: number; // Padding to the bounding box border in pixels
+}
+
+/**
  * Export the current Cytoscape viewport as an SVG file.
  *
  * @param cy - Cytoscape core instance
+ * @param options - Export options
  */
-export function exportViewportAsSvg(cy: cytoscape.Core): void {
+export async function exportViewportAsSvg(
+  cy: cytoscape.Core,
+  options: ExportSvgOptions = {}
+): Promise<void> {
+  const {
+    borderZoom = 100,
+    borderPadding = 0
+  } = options;
+
   try {
+    // Ensure the cytoscape-svg extension is loaded (lazy-load path)
+    await loadExtension('svg');
+
     const cyWithSvg = cy as any;
-    if (typeof cyWithSvg.svg === 'function') {
-      const exported = cyWithSvg.svg({ scale: 1, full: true });
-      const svgContent = replacePngWithSvg(exported);
-      const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'topology.svg';
-      link.click();
-
-      URL.revokeObjectURL(url);
-      log.info('Topology exported as SVG');
-    } else {
+    if (typeof cyWithSvg.svg !== 'function') {
       log.error('SVG export not available - cytoscape-svg extension may not be loaded');
+      return;
     }
+
+    const scale = (borderZoom / 100) * 3;
+    const exported = cyWithSvg.svg({ scale, full: true });
+    let svgContent = replacePngWithSvg(exported);
+
+    if (borderPadding > 0) {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svgContent, 'image/svg+xml');
+      const svgEl = doc.documentElement;
+
+      const width = parseFloat(svgEl.getAttribute('width') || '0');
+      const height = parseFloat(svgEl.getAttribute('height') || '0');
+
+      // Add padding to dimensions
+      const newWidth = width + 2 * borderPadding;
+      const newHeight = height + 2 * borderPadding;
+
+      // Check if there's a viewBox, if not create one
+      let viewBox = svgEl.getAttribute('viewBox');
+      if (!viewBox) {
+        // No viewBox, create one based on dimensions
+        viewBox = `0 0 ${width} ${height}`;
+      }
+
+      const [x, y, vWidth, vHeight] = viewBox.split(' ').map(parseFloat);
+
+      // Calculate padding in viewBox coordinate system
+      const paddingX = borderPadding * (vWidth / width);
+      const paddingY = borderPadding * (vHeight / height);
+
+      // Expand viewBox to include padding
+      const newViewBox = `${x - paddingX} ${y - paddingY} ${vWidth + 2 * paddingX} ${vHeight + 2 * paddingY}`;
+
+      svgEl.setAttribute('viewBox', newViewBox);
+      svgEl.setAttribute('width', newWidth.toString());
+      svgEl.setAttribute('height', newHeight.toString());
+
+      const serializer = new XMLSerializer();
+      svgContent = serializer.serializeToString(svgEl);
+    }
+
+    const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'topology.svg';
+    link.click();
+
+    URL.revokeObjectURL(url);
+    log.info('Topology exported as SVG');
   } catch (error) {
     log.error(`Error capturing topology: ${error}`);
   }

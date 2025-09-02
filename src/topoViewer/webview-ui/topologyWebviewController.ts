@@ -1,7 +1,7 @@
 // file: topologyWebviewController.ts
 
 import type cytoscape from 'cytoscape';
-import { createConfiguredCytoscape } from '../cytoscapeInstanceFactory';
+import { createConfiguredCytoscape, loadExtension } from '../cytoscapeInstanceFactory';
 
 // Import Tailwind CSS and Font Awesome
 import './tailwind.css';
@@ -18,9 +18,10 @@ import { ManagerAddContainerlabNode } from './managerAddContainerlabNode';
 import { ManagerViewportPanels } from './managerViewportPanels';
 import { ManagerUnifiedFloatingPanel } from './managerUnifiedFloatingPanel';
 import { ManagerFreeText } from './managerFreeText';
+import { ManagerNodeEditor } from './managerNodeEditor';
 import { ManagerGroupStyle } from './managerGroupStyle';
 import { CopyPasteManager } from './managerCopyPaste';
-import { exportViewportAsSvg } from './utils';
+import { viewportButtonsCaptureViewportAsSvg } from './uiHandlers';
 import type { ManagerGroupManagement } from './managerGroupManagement';
 import type { ManagerLayoutAlgo } from './managerLayoutAlgo';
 import type { ManagerZoomToFit } from './managerZoomToFit';
@@ -29,7 +30,9 @@ import type { ManagerReloadTopo } from './managerReloadTopo';
 import { ManagerShortcutDisplay } from './managerShortcutDisplay';
 import { layoutAlgoManager as layoutAlgoManagerSingleton, getGroupManager, zoomToFitManager as zoomToFitManagerSingleton, labelEndpointManager as labelEndpointManagerSingleton, getReloadTopoManager } from '../core/managerRegistry';
 import { log } from '../logging/logger';
+import { perfMark, perfMeasure } from '../utilities/performanceMonitor';
 import { registerCyEventHandlers } from './cyEventHandlers';
+import { PerformanceMonitor } from '../utilities/performanceMonitor';
 import topoViewerState from '../state';
 import type { EdgeData } from '../types/topoViewerGraph';
 import { FilterUtils } from '../../helpers/filterUtils';
@@ -55,6 +58,7 @@ class TopologyWebviewController {
   public addNodeManager: ManagerAddContainerlabNode;
   public viewportPanels?: ManagerViewportPanels;
   public unifiedFloatingPanel: ManagerUnifiedFloatingPanel | null = null;
+  public nodeEditor?: ManagerNodeEditor;
   public groupManager: ManagerGroupManagement;
   public groupStyleManager: ManagerGroupStyle;
   /** Layout manager instance accessible by other components */
@@ -64,8 +68,7 @@ class TopologyWebviewController {
   public reloadTopoManager: ManagerReloadTopo;
   public freeTextManager?: ManagerFreeText;
   public copyPasteManager: CopyPasteManager;
-  // eslint-disable-next-line no-unused-vars
-  public captureViewportManager: { viewportButtonsCaptureViewportAsSvg: (cy: cytoscape.Core) => void };
+    public captureViewportManager: { viewportButtonsCaptureViewportAsSvg: () => void };
   private interfaceCounters: Record<string, number> = {};
 
 
@@ -190,6 +193,7 @@ class TopologyWebviewController {
    * @throws Will throw an error if the container element is not found.
    */
   constructor(containerId: string, mode: 'edit' | 'view' = 'edit') {
+    perfMark('topoViewer_init_start');
     const container = document.getElementById(containerId);
     if (!container) {
       throw new Error("Cytoscape container element not found");
@@ -202,7 +206,15 @@ class TopologyWebviewController {
     const theme = this.detectColorScheme();
 
     // Initialize Cytoscape instance
+    perfMark('cytoscape_create_start');
     this.cy = createConfiguredCytoscape(container);
+    perfMeasure('cytoscape_create', 'cytoscape_create_start');
+
+    // Set initial viewport to prevent flashing
+    this.cy.viewport({
+      zoom: 1,
+      pan: { x: container.clientWidth / 2, y: container.clientHeight / 2 }
+    });
     const cyContainer = document.getElementById('cy') as HTMLDivElement;
     if (cyContainer) {
       cyContainer.tabIndex = 0;
@@ -260,11 +272,38 @@ class TopologyWebviewController {
       parentSpacing: -1,
     });
 
+    perfMark('cytoscape_style_start');
     loadCytoStyle(this.cy);
-    fetchAndLoadData(this.cy, this.messageSender);
+    perfMeasure('cytoscape_style', 'cytoscape_style_start');
 
-    // Fetch and load data from the environment and update subtitle and prefix
-    (async () => {
+    perfMark('fetch_data_start');
+    fetchAndLoadData(this.cy, this.messageSender).then(() => {
+      perfMeasure('fetch_data', 'fetch_data_start');
+      perfMeasure('topoViewer_init_total', 'topoViewer_init_start');
+
+      // Send performance data to extension
+      this.messageSender.sendMessageToVscodeEndpointPost('performance-metrics', {
+        metrics: PerformanceMonitor.getMeasures()
+      });
+
+      // Double-check viewport fit with animation for smoothness
+      if (this.cy.elements().length > 0 && typeof requestAnimationFrame !== 'undefined') {
+        // eslint-disable-next-line no-undef
+        requestAnimationFrame(() => {
+          this.cy.animate({
+            fit: {
+              eles: this.cy.elements(),
+              padding: 50
+            },
+            duration: 150,
+            easing: 'ease-out'
+          });
+        });
+      }
+    });
+
+    // Defer environment data loading to avoid blocking initial render
+    setTimeout(async () => {
       try {
         const result = await fetchAndLoadDataEnvironment(["clab-name", "clab-prefix"]);
         const labName = result["clab-name"] || "Unknown";
@@ -276,15 +315,16 @@ class TopologyWebviewController {
       } catch (error) {
         log.error(`Error loading environment data: ${error instanceof Error ? error.message : String(error)}`);
       }
-    })();
+    }, 0);
 
     // Register events based on mode
     this.registerEvents(mode);
     if (mode === 'edit') {
-      this.initializeEdgehandles();
+      // Defer edgehandles initialization
+      setTimeout(() => this.initializeEdgehandles(), 50);
     }
-    // Initialize context menu for both edit and view modes (for free text at minimum)
-    this.initializeContextMenu(mode);
+    // Defer context menu initialization
+    setTimeout(() => this.initializeContextMenu(mode), 100);
 
     new ManagerShortcutDisplay();
 
@@ -301,14 +341,9 @@ class TopologyWebviewController {
     // Initialize copy paste manager
     this.copyPasteManager = new CopyPasteManager(this.cy, this.messageSender, this.groupStyleManager, this.freeTextManager);
 
-    // Load annotations after managers are created
-    // We need to wait a bit for the initial layout to complete
+    // Annotations will be loaded by managerCytoscapeFetchAndLoad after layout completes
+    // Only load group styles here since they're not loaded elsewhere
     setTimeout(() => {
-      this.freeTextManager?.loadAnnotations().then(() => {
-        log.info('Free text annotations loaded successfully');
-      }).catch((error) => {
-        log.error(`Failed to load free text annotations: ${error}`);
-      });
       this.groupStyleManager?.loadGroupStyles().catch((error) => {
         log.error(`Failed to load group style annotations: ${error}`);
       });
@@ -316,6 +351,10 @@ class TopologyWebviewController {
 
     if (mode === 'edit') {
       this.viewportPanels = new ManagerViewportPanels(this.saveManager, this.cy);
+      // Expose to window for other components to access
+      (window as any).viewportPanels = this.viewportPanels;
+      // Always initialize enhanced node editor
+      this.nodeEditor = new ManagerNodeEditor(this.cy, this.saveManager);
     }
 
     // Initialize unified floating panel for both modes
@@ -340,8 +379,8 @@ class TopologyWebviewController {
 
     // Create capture viewport manager with the required method
     this.captureViewportManager = {
-      viewportButtonsCaptureViewportAsSvg: (cy: cytoscape.Core) => {
-        exportViewportAsSvg(cy);
+      viewportButtonsCaptureViewportAsSvg: () => {
+        viewportButtonsCaptureViewportAsSvg();
       }
     };
 
@@ -353,7 +392,13 @@ class TopologyWebviewController {
       } else if (node.data('topoViewerRole') === 'cloud') {
         this.viewportPanels?.panelNetworkEditor(node);
       } else {
-        this.viewportPanels?.panelNodeEditor(node);
+        // Use node editor
+        if (this.nodeEditor) {
+          this.nodeEditor.open(node);
+        } else {
+          // Fallback to standard editor if node editor not available (shouldn't happen)
+          this.viewportPanels?.panelNodeEditor(node);
+        }
       }
     });
 
@@ -384,7 +429,7 @@ class TopologyWebviewController {
     window.viewportButtonsLabelEndpoint = () =>
       this.labelEndpointManager.viewportButtonsLabelEndpoint(this.cy);
     window.viewportButtonsCaptureViewportAsSvg = () =>
-      this.captureViewportManager.viewportButtonsCaptureViewportAsSvg(this.cy);
+      this.captureViewportManager.viewportButtonsCaptureViewportAsSvg();
     window.viewportButtonsReloadTopo = () =>
       this.reloadTopoManager.viewportButtonsReloadTopo(this.cy);
     window.viewportButtonsSaveTopo = () =>
@@ -440,7 +485,9 @@ class TopologyWebviewController {
    * Enables the edgehandles instance for creating edges.
    * @private
    */
-  private initializeEdgehandles(): void {
+  private async initializeEdgehandles(): Promise<void> {
+    // Load edgehandles extension lazily
+    await loadExtension('edgehandles');
     const edgehandlesOptions = {
       hoverDelay: 50,
       snap: false,
@@ -492,7 +539,9 @@ class TopologyWebviewController {
   /**
  * Initializes the circular context menu on nodes.
   */
-  private initializeContextMenu(mode: 'edit' | 'view' = 'edit'): void {
+  private async initializeContextMenu(mode: 'edit' | 'view' = 'edit'): Promise<void> {
+    // Load context menu extension lazily
+    await loadExtension('cxtmenu');
     const self = this;
     // Context menu for free text elements (available in both edit and view modes)
     this.cy.cxtmenu({
@@ -564,6 +613,8 @@ class TopologyWebviewController {
               if (!ele.isNode()) {
                 return;
               }
+              // Prevent global canvas click handler from closing panels
+              this.viewportPanels?.setNodeClicked(true);
               // inside here TS infers ele is NodeSingular
                 this.viewportPanels?.panelNetworkEditor(ele);
             }
@@ -579,8 +630,12 @@ class TopologyWebviewController {
                 if (!ele.isNode()) {
                   return;
                 }
+                // Prevent global canvas click handler from closing panels
+                this.viewportPanels?.setNodeClicked(true);
                 // inside here TS infers ele is NodeSingular
-                this.viewportPanels?.panelNodeEditor(ele);
+                if (this.nodeEditor) {
+                  this.nodeEditor.open(ele);
+                }
               }
             });
           }
@@ -909,29 +964,52 @@ class TopologyWebviewController {
       // Context menu for edges/links in viewer mode
         this.cy.cxtmenu({
           selector: 'edge',
-          commands: (ele: cytoscape.Singular) => {
-            const sourceName = ele.data("source");
-            const targetName = ele.data("target");
+            commands: (ele: cytoscape.Singular) => {
+              const sourceId = ele.data("source");
+              const targetId = ele.data("target");
 
-            // Check if nodes are special network endpoints
-            const sourceNode = self.cy.getElementById(sourceName);
-            const targetNode = self.cy.getElementById(targetName);
+              // Check if nodes are special network endpoints
+              const sourceNode = self.cy.getElementById(sourceId);
+              const targetNode = self.cy.getElementById(targetId);
 
             // Check for all types of special network endpoints (bridge, host, mgmt-net, macvlan)
-            const sourceIsSpecialNetwork =
-              isSpecialNodeOrBridge(sourceName, self.cy) ||
-              (sourceNode.length > 0 &&
-                (sourceNode.data('extraData')?.kind === 'bridge' ||
-                 sourceNode.data('extraData')?.kind === 'ovs-bridge'));
+              const sourceIsSpecialNetwork =
+                isSpecialNodeOrBridge(sourceId, self.cy) ||
+                (sourceNode.length > 0 &&
+                  (sourceNode.data('extraData')?.kind === 'bridge' ||
+                   sourceNode.data('extraData')?.kind === 'ovs-bridge'));
 
-            const targetIsSpecialNetwork =
-              isSpecialNodeOrBridge(targetName, self.cy) ||
-              (targetNode.length > 0 &&
-                (targetNode.data('extraData')?.kind === 'bridge' ||
-                 targetNode.data('extraData')?.kind === 'ovs-bridge'));
+              const targetIsSpecialNetwork =
+                isSpecialNodeOrBridge(targetId, self.cy) ||
+                (targetNode.length > 0 &&
+                  (targetNode.data('extraData')?.kind === 'bridge' ||
+                   targetNode.data('extraData')?.kind === 'ovs-bridge'));
 
-            const sourceEndpoint = ele.data("sourceEndpoint") || "Port A";
-            const targetEndpoint = ele.data("targetEndpoint") || "Port B";
+              const extra = ele.data('extraData') || {};
+
+              // Get the display names - use the node ID from the graph (which is the short name without prefix)
+              // Fall back to removing prefix from long name if needed
+              const getDisplayName = (nodeId: string, longName: string | undefined): string => {
+                // First try to use the node ID directly (this is typically the short name)
+                const node = self.cy.getElementById(nodeId);
+                if (node.length > 0 && node.data('name')) {
+                  return node.data('name');
+                }
+
+                // If we have a long name with prefix, remove the prefix
+                if (longName && topoViewerState.prefixName && longName.startsWith(topoViewerState.prefixName + '-')) {
+                  return longName.substring(topoViewerState.prefixName.length + 1);
+                }
+
+                // Otherwise return what we have
+                return longName || nodeId;
+              };
+
+              const sourceName = getDisplayName(sourceId, extra.clabSourceLongName);
+              const targetName = getDisplayName(targetId, extra.clabTargetLongName);
+
+            const sourceEndpoint = extra.clabSourcePort || ele.data("sourceEndpoint") || "Port A";
+            const targetEndpoint = extra.clabTargetPort || ele.data("targetEndpoint") || "Port B";
 
             const commands = [];
 
@@ -939,7 +1017,7 @@ class TopologyWebviewController {
             if (!sourceIsSpecialNetwork) {
               commands.push({
                 content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
-                          <i class="fas fa-network-wired" style="font-size:1.4em;"></i>
+                          <img src="${(window as any).imagesUrl}/wireshark_bold.svg" style="width:1.4em; height:1.4em; filter: brightness(0) invert(1);" />
                           <div style="height:0.3em;"></div>
                           <span style="font-size:0.9em;">${sourceName} - ${sourceEndpoint}</span>
                         </div>`,
@@ -949,10 +1027,12 @@ class TopologyWebviewController {
                   }
                   // Use setTimeout to ensure this runs after any other event handlers
                   setTimeout(async () => {
-                    const nodeName = ele.data("source");
-                    const interfaceName = ele.data("sourceEndpoint") || "";
+                    const extra = ele.data('extraData') || {};
+                    const nodeName = extra.clabSourceLongName || ele.data('source');
+                    const interfaceName = extra.clabSourcePort || ele.data('sourceEndpoint') || "";
                     if (nodeName && interfaceName) {
-                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-link-capture', { nodeName, interfaceName });
+                      // Use the default capture method from settings
+                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-interface-capture', { nodeName, interfaceName });
                     }
                   }, 50);
                 }
@@ -963,7 +1043,7 @@ class TopologyWebviewController {
             if (!targetIsSpecialNetwork) {
               commands.push({
                 content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
-                          <i class="fas fa-network-wired" style="font-size:1.4em;"></i>
+                          <img src="${(window as any).imagesUrl}/wireshark_bold.svg" style="width:1.4em; height:1.4em; filter: brightness(0) invert(1);" />
                           <div style="height:0.3em;"></div>
                           <span style="font-size:0.9em;">${targetName} - ${targetEndpoint}</span>
                         </div>`,
@@ -973,58 +1053,12 @@ class TopologyWebviewController {
                   }
                   // Use setTimeout to ensure this runs after any other event handlers
                   setTimeout(async () => {
-                    const nodeName = ele.data("target");
-                    const interfaceName = ele.data("targetEndpoint") || "";
+                    const extra = ele.data('extraData') || {};
+                    const nodeName = extra.clabTargetLongName || ele.data('target');
+                    const interfaceName = extra.clabTargetPort || ele.data('targetEndpoint') || "";
                     if (nodeName && interfaceName) {
-                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-link-capture', { nodeName, interfaceName });
-                    }
-                  }, 50);
-                }
-              });
-            }
-
-            // Add VNC capture option for source if it's not a special network
-            if (!sourceIsSpecialNetwork) {
-              commands.push({
-                content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
-                          <i class="fas fa-desktop" style="font-size:1.4em;"></i>
-                          <div style="height:0.3em;"></div>
-                          <span style="font-size:0.85em;">${sourceName} - ${sourceEndpoint} (VNC)</span>
-                        </div>`,
-                select: (ele: cytoscape.Singular) => {
-                  if (!ele.isEdge()) {
-                    return;
-                  }
-                  // Use setTimeout to ensure this runs after any other event handlers
-                  setTimeout(async () => {
-                    const nodeName = ele.data("source");
-                    const interfaceName = ele.data("sourceEndpoint") || "";
-                    if (nodeName && interfaceName) {
-                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-link-capture-edgeshark-vnc', { nodeName, interfaceName });
-                    }
-                  }, 50);
-                }
-              });
-            }
-
-            // Add VNC capture option for target if it's not a special network
-            if (!targetIsSpecialNetwork) {
-              commands.push({
-                content: `<div style="display:flex; flex-direction:column; align-items:center; line-height:1;">
-                          <i class="fas fa-desktop" style="font-size:1.4em;"></i>
-                          <div style="height:0.3em;"></div>
-                          <span style="font-size:0.85em;">${targetName} - ${targetEndpoint} (VNC)</span>
-                        </div>`,
-                select: (ele: cytoscape.Singular) => {
-                  if (!ele.isEdge()) {
-                    return;
-                  }
-                  // Use setTimeout to ensure this runs after any other event handlers
-                  setTimeout(async () => {
-                    const nodeName = ele.data("target");
-                    const interfaceName = ele.data("targetEndpoint") || "";
-                    if (nodeName && interfaceName) {
-                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-link-capture-edgeshark-vnc', { nodeName, interfaceName });
+                      // Use the default capture method from settings
+                      await self.messageSender.sendMessageToVscodeEndpointPost('clab-interface-capture', { nodeName, interfaceName });
                     }
                   }, 50);
                 }
@@ -1103,7 +1137,7 @@ class TopologyWebviewController {
 
           return commands;
         },
-        menuRadius: 160, // larger radius for better readability
+        menuRadius: 110, // standard radius for fewer items
         fillColor: 'rgba(31, 31, 31, 0.75)', // the background colour of the menu
         activeFillColor: 'rgba(66, 88, 255, 1)', // the colour used to indicate the selected command
         activePadding: 5, // additional size in pixels for the active command
@@ -1306,10 +1340,76 @@ class TopologyWebviewController {
 
         const sourceEndpoint = this.getNextEndpoint(sourceNode.id());
         const targetEndpoint = this.getNextEndpoint(targetNode.id());
-        addedEdge.data({ sourceEndpoint, targetEndpoint, editor: 'true' });
-        if (this.isNetworkNode(sourceNode.id()) || this.isNetworkNode(targetNode.id())) {
+
+        // Prepare edge data
+        const edgeData: any = { sourceEndpoint, targetEndpoint, editor: 'true' };
+
+        // Transfer extended properties from network nodes to the edge
+        const sourceIsNetwork = this.isNetworkNode(sourceNode.id());
+        const targetIsNetwork = this.isNetworkNode(targetNode.id());
+
+        if (sourceIsNetwork || targetIsNetwork) {
           addedEdge.addClass('stub-link');
+
+          // Get the network node (could be source or target)
+          const networkNode = sourceIsNetwork ? sourceNode : targetNode;
+          const networkData = networkNode.data();
+          const networkType = networkData.extraData?.kind || networkNode.id().split(':')[0];
+
+          // Transfer extended properties from network node to edge
+          if (networkData.extraData) {
+            const extData: any = {};
+
+            // Set link type
+            if (networkType !== 'bridge' && networkType !== 'ovs-bridge') {
+              extData.extType = networkType;
+            }
+
+            // Transfer all extended properties
+            if (networkData.extraData.extMac !== undefined) {
+              // MAC address for the network side endpoint
+              if (sourceIsNetwork) {
+                extData.extSourceMac = networkData.extraData.extMac;
+              } else {
+                extData.extTargetMac = networkData.extraData.extMac;
+              }
+            }
+            if (networkData.extraData.extMtu !== undefined) {
+              extData.extMtu = networkData.extraData.extMtu;
+            }
+            if (networkData.extraData.extVars !== undefined) {
+              extData.extVars = networkData.extraData.extVars;
+            }
+            if (networkData.extraData.extLabels !== undefined) {
+              extData.extLabels = networkData.extraData.extLabels;
+            }
+
+            // Transfer host interface for host/mgmt-net/macvlan
+            if ((networkType === 'host' || networkType === 'mgmt-net' || networkType === 'macvlan') &&
+                networkData.extraData.extHostInterface !== undefined) {
+              extData.extHostInterface = networkData.extraData.extHostInterface;
+            }
+
+            // Transfer macvlan mode
+            if (networkType === 'macvlan' && networkData.extraData.extMode !== undefined) {
+              extData.extMode = networkData.extraData.extMode;
+            }
+
+            // Transfer vxlan properties
+            if (networkType === 'vxlan' || networkType === 'vxlan-stitch') {
+              if (networkData.extraData.extRemote !== undefined) extData.extRemote = networkData.extraData.extRemote;
+              if (networkData.extraData.extVni !== undefined) extData.extVni = networkData.extraData.extVni;
+              if (networkData.extraData.extUdpPort !== undefined) extData.extUdpPort = networkData.extraData.extUdpPort;
+            }
+
+            // Add extended properties to edge data
+            if (Object.keys(extData).length > 0) {
+              edgeData.extraData = extData;
+            }
+          }
         }
+
+        addedEdge.data(edgeData);
       });
 
     } else {
@@ -1760,11 +1860,14 @@ document.addEventListener('DOMContentLoaded', () => {
     controller.dispose();
   });
 
-  // After EVERYTHING is done, trigger fit-to-viewport
+  // Initial fit already happens in fetchAndLoadData, but do a final adjustment
+  // after a short delay to account for any async rendering
   setTimeout(() => {
-    controller.cy.fit(controller.cy.elements(), 120);
-    log.info('Initial fit-to-viewport triggered after full initialization');
-  }, 2000);
+    if (controller.cy.elements().length > 0) {
+      controller.cy.fit(controller.cy.elements(), 50);
+      log.debug('Final viewport adjustment completed');
+    }
+  }, 100); // Much shorter delay - just for final adjustments
 });
 
 export default TopologyWebviewController;
